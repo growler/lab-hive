@@ -207,8 +207,6 @@ start_container() {
     mknod -m 0666 $dev/random  c 1 8
     mknod -m 0666 $dev/urandom c 1 9
     chown -R $subuid:$subgid $dev
-    touch $dev/log
-    mount --bind /dev/log $dev/log
 
     rm -rf /run/$hive_user-$box_name
     mkdir -p /run/$hive_user-$box_name
