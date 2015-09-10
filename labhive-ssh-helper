@@ -110,6 +110,24 @@ hive.ipv4   = $ipv4
 EOF
     ) > $box_conf
     chown -R $hive_user:$hive_user $(dirname $box_conf)
+    [ -z "$ipv4" ] || {
+        local nginx_proxy_uri=$(sed -n 's/^hive\.http\.uri[[:space:]]\+=[[:space:]]\+\(.*\)[[:space:]]*$/\1/ p' < $hive_root/hive/config)
+        [ -z "$nginx_proxy_uri" ] || {
+           cat<<EOF >/etc/nginx/sites-available/$box_name
+server {
+	listen 80;
+	listen [::]:80;
+	server_name $box_name.$nginx_proxy_uri;
+	location / {
+		proxy_pass http://$ipv4;
+		proxy_set_header Host $box_name;
+	}
+}
+EOF
+            ln -sf /etc/nginx/sites-available/$box_name /etc/nginx/sites-enabled
+            service nginx reload >/dev/null 2>&1
+        }
+    }
 }
 
 setup_network() {
