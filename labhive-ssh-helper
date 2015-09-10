@@ -1,0 +1,222 @@
+#!/bin/sh
+
+su() {
+   /bin/su $hive_user -c "$*"
+}
+
+warn() {
+    echo "$@" >&2 ; [ -t 1 ] || echo "$@"
+}
+    
+fail() {
+   warn "$@" ; exit 1
+}
+
+authorized_keys() {
+    local home=$( getent passwd "$1" | cut -d: -f6 )
+    [ -f "$home/.ssh/authorized_keys" ] && cat $home/.ssh/authorized_keys 2>/dev/null
+    [ "root" = "$1" ] || return 0
+    find /home -mindepth 4 -maxdepth 4 -type f -path "/home/*/hive/keys/*" -print | {
+        while read REPLY ; do
+            local key="$REPLY"
+            local boxname=$(basename "$REPLY")
+            local username=${REPLY##/home/}
+            username=${username%%/*}
+            {
+                while read REPLY ; do                
+                    [ -n "$REPLY" ] && echo no-port-forwarding,no-X11-forwarding,no-user-rc,command=\"$0 $username $boxname \$SSH_ORIGINAL_COMMAND\" $REPLY
+                done
+            } < "$key"
+        done
+    } 
+    return 0
+}
+
+ensure_cgroup() {
+    cgget $2 -n 2>/dev/null | grep -q cpuset.cpus
+    if [ $? -ne 0 ]; then
+        cgcreate -t $1:$1 -a $1:$1 -g cpuset,cpu,cpuacct,memory,devices,freezer,net_cls,blkio,perf_event,net_prio:$2
+        local parent=$(dirname $2)
+        [ "." = "$parent" ] && parent=/
+        cgset -r cpuset.cpus=$(cgget $parent -r cpuset.cpus -v -n) $2
+        cgset -r cpuset.mems=$(cgget $parent -r cpuset.mems -v -n) $2
+    fi
+}
+
+box_pid() { 
+    mkdir -p /run/lock
+    (
+        flock -w 5 9 || fail "hive box is locked"
+        local pid
+        pid=$(su /usr/bin/lxc-info -n $box_name -pH 2>/dev/null)
+        if [ $? -ne 0 ]; then         # container does not exist (yet)
+            create_container
+            pid=$(start_container) || exit 1
+        elif [ "x" = "x$pid" ]; then  # container is not started (yet)
+            pid=$(start_container) || exit 1
+        fi
+        echo $pid
+        rm -f /run/lock/$hive_user-$box_name.lock
+    ) 9>>/run/lock/$hive_user-$box_name.lock
+}
+
+main() {    
+    hive_user=$1 
+    hive_root=/home/$hive_user
+    box_name=$2
+    shift 2
+    box_base=$hive_root/hive/base
+    box_root=$hive_root/hive/boxes/$box_name
+    box_conf=$hive_root/.local/share/lxc/$box_name/config
+    box_mount=$hive_root/.local/share/lxc/$box_name/root
+    subuid=$(sed -n "s/^$hive_user:\(.*\):.*$/\1/ p" < /etc/subuid)
+    subgid=$(sed -n "s/^$hive_user:\(.*\):.*$/\1/ p" < /etc/subgid)
+    local pid
+    pid=$(box_pid) || exit 1
+    if [ $# -gt 0 ]; then
+        cgexec -g *:$hive_user/$box_name /usr/bin/nsenter -m -u -i -n -p -U -t $pid -G 0 -S 0 /bin/sh -c -- "$*"
+    else
+        cgexec -g *:$hive_user/$hive_name /usr/bin/nsenter -m -u -i -n -p -U -t $pid -G 0 -S 0 /sbin/runuser -
+    fi
+}
+
+get_free_ip() {
+    hive_ip_range=$(sed -n 's/^hive\.ipv4\.net[[:space:]]\+=[[:space:]]\+\(.*\)[[:space:]]*$/\1/ p' < $hive_root/hive/config)
+    if [ -z "$hive_ip_range" ]; then
+        return 0
+    fi
+    (
+    	flock -w 3 8 || fail "Hive is locked"
+    	find $hive_root/.local/share/lxc -mindepth 2 -maxdepth 2 -type f -name config -exec cat '{}' \; |\
+    		sed -n 's/^hive\.ipv4[[:space:]]\+=[[:space:]]\+\(.*\)[[:space:]]*$/\1/ p' |\
+    		sort -V > /tmp/$hive_user-ip-leased
+    	prips $hive_ip_range | sort -V > /tmp/$hive_user-ip-all
+    	comm --nocheck-order -13 /tmp/$hive_user-ip-leased /tmp/$hive_user-ip-all | head -1
+    	rm -f /tmp/$hive_user-ip-leased /tmp/$hive_user-ip-all
+    ) 8>>/run/$hive_user-ip-all
+}
+
+create_container() {
+    local ipv4=$(get_free_ip)
+    mkdir -p $(dirname $box_conf)
+    (
+        cat<<EOF
+lxc.utsname = $box_name
+lxc.include = $hive_root/hive/config
+lxc.rootfs  = $box_mount
+EOF
+        [ -z "$ipv4" ] || cat<<EOF
+hive.ipv4   = $ipv4
+EOF
+    ) > $box_conf
+    chown -R $hive_user:$hive_user $(dirname $box_conf)
+}
+
+setup_network() {
+    local pid=$1
+    nsenter -n -t $pid ip link set lo up
+    local ip=$(sed -n 's/^hive\.ipv4[[:space:]]\+=[[:space:]]\+\(.*\)[[:space:]]*$/\1/ p' < $box_conf)
+    if [ ! -z "$ip" ]; then
+       [ -z "$hive_ip_range" ] && hive_ip_range=$(sed -n 's/^hive\.ipv4\.net[[:space:]]\+=[[:space:]]\+\(.*\)[[:space:]]*$/\1/ p' < $hive_root/hive/config)    
+       [ -z "$hive_ip_range" ] && return 0
+       local net=$(prips -c $hive_ip_range)
+       local gw=$(sed -n 's/^hive\.ipv4\.gw[[:space:]]\+=[[:space:]]\+\(.*\)[[:space:]]*$/\1/ p' < $hive_root/hive/config)
+       [ -z "$gw" ] && return 0
+       local link=$(sed -n 's/^hive\.link[[:space:]]\+=[[:space:]]\+\(.*\)[[:space:]]*$/\1/ p' < $hive_root/hive/config)
+       [ -z "$link" ] && return 0
+       local ifname=$(mktemp -u ethXXXX)
+       net=${net##*/}
+       ip link add link $link $ifname type macvlan mode bridge
+       ip link set $ifname netns /proc/$pid/ns/net
+       nsenter -t $pid -n ip link set $ifname name eth0
+       nsenter -t $pid -n ip link set eth0 up
+       nsenter -t $pid -n ip addr add $ip/$net dev eth0
+       nsenter -t $pid -n ip route add default via $gw
+    fi
+ }
+
+start_container() {
+    ensure_cgroup $hive_user $hive_user
+    [ -d "$box_mount" ] || {
+        mkdir -p $box_mount
+        chown $subuid:$subgid $box_mount
+    }
+    mountpoint -q $box_mount && fail "hive box is mounted"
+    if [ "$box_name" = "base" ]; then
+        mount --bind $box_base $box_mount || fail "Failed to mount container root"
+    else
+        [ -d "$box_root" ] || {
+            mkdir -p $box_root
+            chown $subuid:$subgid $box_root
+        }
+        [ -d "$box_root/fs" ] || {
+            mkdir -p $box_root/fs
+            chown $subuid:$subgid $box_root/fs
+        }
+        [ -d "$box_root/root" ] || {
+            mkdir -p $box_root
+            cp -a $box_base/etc/skel $box_root/root
+            chown -R $subuid:$subgid $box_root/root
+        }
+        [ -d "$box_root/log" ] || {
+            mkdir -p $box_root/log
+            find $box_base/var/log -mindepth 1 -type d -print | {
+                while read dir ; do
+                    mkdir -p $box_root/log/${dir##$box_base/var/log/}
+                done
+            }
+            touch $box_root/log/utmp
+            touch $box_root/log/wtmp
+            chown -R $subuid:$subgid $box_root/log
+        }
+        mount -t aufs none -o br:$box_root/fs=rw:$box_base=ro,noplink,xino=/run/aufs.xino $box_mount  || fail "Failed to mount container root"
+        mount --bind $box_root/root $box_mount/root
+        mount --bind $box_root/log  $box_mount/var/log
+        mount --bind $box_base/var/lib/dpkg $box_mount/var/lib/dpkg
+        mount -o remount,ro,bind $box_mount/var/lib/dpkg        
+    fi
+    if [ -d "$hive_root/hive/shared" ] && [ -d "$box_mount/shared" ]; then
+        chown $subuid:$subgid $hive_root/hive/shared
+        mount --bind "$hive_root/hive/shared" "$box_mount/shared"        
+    fi
+    local dev=$box_mount/dev
+    mount -t tmpfs -o nr_blocks=64,nr_inodes=64,uid=$subuid,gid=$subgid none $dev
+    mknod -m 0666 $dev/tty     c 5 0
+    mknod -m 0666 $dev/console c 5 1
+    mknod -m 0666 $dev/null    c 1 3
+    mknod -m 0666 $dev/zero    c 1 3
+    mknod -m 0666 $dev/full    c 1 7
+    mknod -m 0666 $dev/random  c 1 8
+    mknod -m 0666 $dev/urandom c 1 9
+    chown -R $subuid:$subgid $dev
+    touch $dev/log
+    mount --bind /dev/log $dev/log
+
+    rm -rf /run/$hive_user-$box_name
+    mkdir -p /run/$hive_user-$box_name
+    chown -R $subuid:$subgid /run/$hive_user-$box_name
+    mount --bind /run/$hive_user-$box_name $box_mount/run
+
+    rm -rf /tmp/$hive_user-$box_name
+    mkdir -p /tmp/$hive_user-$box_name
+    chmod a+rwxt /tmp/$hive_user-$box_name
+    chown -R $subuid:$subgid /tmp/$hive_user-$box_name
+    mount --bind /tmp/$hive_user-$box_name $box_mount/tmp    
+    
+    su /usr/bin/cgexec -g *:$hive_user /usr/bin/lxc-start -C -n $box_name -d
+    su /usr/bin/lxc-wait -n $box_name -s RUNNING -t 5 || fail "Failed to start container"
+    local pid
+    pid=$(su /usr/bin/lxc-info -n $box_name -pH 2>/dev/null)
+    if [ $? -ne 0 ] || [ "x" = "x$pid" ]; then
+        fail "Failed to start container"
+    fi
+    setup_network $pid
+    umount -R $box_mount
+    echo $pid
+}
+
+if [ $# -eq 1 ]; then
+    authorized_keys "$@"
+else
+   main "$@"
+fi

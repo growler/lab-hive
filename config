@@ -1,0 +1,10 @@
+hive.link     = <link>
+hive.ipv4.net = <first-ip> <last-ip>
+hive.ipv4.gw  = <gatway>
+
+lxc.network.type = empty
+lxc.mount.auto   = proc:mixed sys:ro
+lxc.pivotdir     = lxc_putold
+lxc.tty          = 0
+lxc.autodev      = 0
+lxc.pts          = 64
