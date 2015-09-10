@@ -74,9 +74,9 @@ main() {
     local pid
     pid=$(box_pid) || exit 1
     if [ $# -gt 0 ]; then
-        cgexec -g *:$hive_user/$box_name /usr/bin/nsenter -m -u -i -n -p -U -t $pid -G 0 -S 0 /bin/sh -c -- "$*"
+        exec cgexec -g *:$hive_user/$box_name /usr/bin/nsenter -m -u -i -n -p -U -t $pid -G 0 -S 0 /bin/sh -c -- "cd /root; $*"
     else
-        cgexec -g *:$hive_user/$hive_name /usr/bin/nsenter -m -u -i -n -p -U -t $pid -G 0 -S 0 /sbin/runuser -
+        exec cgexec -g *:$hive_user/$box_name /usr/bin/nsenter -m -u -i -n -p -U -t $pid -G 0 -S 0 /sbin/runuser -
     fi
 }
 
